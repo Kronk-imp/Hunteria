@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hunteria: orchestration légère autour de run_scan.sh -> uploader.py -> (optionnel) exec_cmds.py
+# Usage:
+#   ./hunteria                # run_scan.sh -> uploader.py (pas d'exécution des commandes)
+#   ./hunteria --exec         # + exécuter automatiquement les commandes IA
+#   ./hunteria --no-wait      # ne pas faire les attentes sur fichiers (plus rapide, moins sûr)
+#   ./hunteria --timeout 120  # timeout d'attente des artefacts en secondes (défaut: 90)
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+EXEC=false
+DO_WAIT=true
+TIMEOUT=90
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --exec) EXEC=true; shift;;
+    --no-wait) DO_WAIT=false; shift;;
+    --timeout) TIMEOUT="${2:-90}"; shift 2;;
+    -h|--help)
+      echo "Usage: $0 [--exec] [--no-wait] [--timeout SECONDS]"
+      exit 0;;
+    *)
+      echo "Unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+# --- helpers ---------------------------------------------------------------
+
+log() { printf "[hunteria] %s\n" "$*" >&2; }
+
+# Attend qu'au moins un fichier correspondant existe ET soit "stable"
+# (taille inchangée pendant 2 secondes). Évite de lire un fichier encore en écriture.
+wait_for_artifact() {
+  local glob_pat="$1" ; local timeout="${2:-90}"
+  local start end t1 t2
+  start="$(date +%s)"
+  while true; do
+    shopt -s nullglob
+    local files=( $glob_pat )
+    shopt -u nullglob
+    if (( ${#files[@]} > 0 )); then
+      # vérifier stabilité du premier match
+      t1=$(stat -c%s "${files[0]}") || t1=0
+      sleep 2
+      t2=$(stat -c%s "${files[0]}") || t2=0
+      if [[ "$t1" == "$t2" ]]; then
+        log "Artefact détecté et stable: ${files[0]}"
+        return 0
+      fi
+    fi
+    end="$(date +%s)"
+    if (( end - start >= timeout )); then
+      log "Alerte: délai dépassé en attente d'artefact: $glob_pat"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# --- step 1: run_scan.sh ---------------------------------------------------
+log "Étape 1/3 — lancement run_scan.sh"
+./run_scan.sh
+log "run_scan.sh terminé (code=$?)"
+
+if $DO_WAIT; then
+  # Attendre un JSON de reco des pages (produit par logscan.py)
+  mkdir -p reco
+  wait_for_artifact "reco/ia_pages_*.json" "$TIMEOUT" || log "Avertissement: aucun ia_pages_*.json détecté"
+fi
+
+# --- step 2: uploader.py ---------------------------------------------------
+log "Étape 2/3 — lancement uploader.py (génération des commandes IA)"
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "[hunteria] ERREUR: OPENAI_API_KEY non défini, requis par uploader.py" >&2
+  exit 3
+fi
+python3 uploader.py
+log "uploader.py terminé (code=$?)"
+
+if $DO_WAIT; then
+  # Attendre la sortie des .cmds.json
+  mkdir -p reco/triage
+  wait_for_artifact "reco/triage/*.cmds.json" "$TIMEOUT" || log "Avertissement: aucun *.cmds.json détecté"
+fi
+
+# --- step 3: exec_cmds.py (optionnel) -------------------------------------
+if $EXEC; then
+  log "Étape 3/3 — exécution des commandes IA (exec_cmds.py)"
+  mkdir -p reco/exec
+  python3 exec_cmds.py
+  log "exec_cmds.py terminé (code=$?)"
+else
+  log "Étape 3/3 sautée — (utilise --exec pour lancer exec_cmds.py automatiquement)"
+fi
+
+log "Pipeline terminé."
