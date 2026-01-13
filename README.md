@@ -98,7 +98,7 @@ export OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 1. clone the repo:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Kronk-imp/Hunteria
 cd hunteria
 ```
 
